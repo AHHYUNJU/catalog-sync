@@ -1,0 +1,135 @@
+# 카탈로그 동기화 — 손님 요청이 카페24로 내려가지 않게 하는 유일한 공급 경로다.
+#
+#   크론(여기) → /api/cron/catalog-sync → Cafe24 Admin API → Upstash Redis
+#   손님        → Redis 만 읽음. 카페24 0콜
+#
+# 이게 안 돌면 스토어가 낡은 채로 굳고, 비거나 만료되면 읽기 경로가 카페24
+# 직행으로 떨어진다(콜드 키 + 동시 30명 = 90콜 실측). 즉 이 파일은 부가기능이
+# 아니라 방어막의 동력이다.
+#
+# ⚠️ Vercel 크론을 쓰지 않는다. 헤드리스에서 vercel.json 에 크론을 여러 개
+# 넣자 Vercel 이 배포를 아예 만들지 않았다 — 빌드 실패도 취소도 아니고 시도
+# 자체가 없었다. GitHub Actions 는 그 플랜 한도와 무관하고 무료다.
+#
+# ⚠️ 적어놓은 주기대로 안 돈다. 예약 워크플로는 GitHub 이 지연시켜서 */10 이
+# 실제로는 30~60분이 되기도 한다(헤드리스 실측). 신선도는 약 1시간으로 보고
+# "10분 안에 가격이 반영된다"고 전제하지 말 것.
+
+name: catalog-sync
+
+on:
+  schedule:
+    # 증분 — 목록 3콜. 바뀐 상품이 없으면 그걸로 끝난다.
+    - cron: '*/10 * * * *'
+    # 전체 — 카페24가 updated_date 를 안 올리는 변경(품목 재고 등)을 줍는다.
+    # 상품이 하루에 몇 번씩 바뀌지 않으므로 6시간이면 충분하다.
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '동기화 모드'
+        type: choice
+        options: [incremental, full]
+        default: incremental
+
+# 앞 실행이 안 끝났는데 겹치면 카페24를 두 배로 두드린다. 취소도 하지 않는다 —
+# 이어받기 상태(pending)를 서버가 들고 있어서 중간에 끊으면 그 회차가 낭비된다.
+concurrency:
+  group: catalog-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 동기화 (done 이 될 때까지 이어받기)
+        env:
+          CATALOG_SYNC_URL: ${{ secrets.CATALOG_SYNC_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          # 어느 스케줄이 깨웠는지로 모드를 정한다. 손수 돌릴 때는 입력값.
+          MODE: ${{ inputs.mode || (github.event.schedule == '17 */6 * * *' && 'full' || 'incremental') }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${CATALOG_SYNC_URL}" ] || [ -z "${CRON_SECRET}" ]; then
+            echo "::error::CATALOG_SYNC_URL 또는 CRON_SECRET 시크릿이 없습니다."
+            exit 1
+          fi
+
+          echo "mode=${MODE}"
+
+          # 한 번에 상세 40건씩 하고 나머지는 서버가 기억한다. done 이 true 가
+          # 될 때까지 이어받는다. full 은 매번 전체 대기열을 새로 만들기 때문에
+          # 첫 요청에만 쓰고, 이후 요청은 pending 을 읽는 incremental 로 전환한다.
+          for attempt in $(seq 1 10); do
+            if [ "${attempt}" -gt 1 ]; then sleep 5; fi
+
+            request_mode="${MODE}"
+            if [ "${MODE}" = "full" ] && [ "${attempt}" -gt 1 ]; then
+              request_mode="incremental"
+            fi
+
+            # 카페24/Vercel의 일시적인 타임아웃과 과부하는 같은 요청을 최대
+            # 3번 재시도한다. 인증·경로 오류(401·403·404)는 기다려도 낫지
+            # 않으므로 즉시 실패시킨다.
+            for request_attempt in 1 2 3; do
+              : > response.json
+              if status=$(curl -sS -o response.json -w '%{http_code}' \
+                -X POST "${CATALOG_SYNC_URL}/api/cron/catalog-sync?mode=${request_mode}" \
+                -H "authorization: Bearer ${CRON_SECRET}" \
+                --max-time 300); then
+                curl_exit=0
+              else
+                curl_exit=$?
+                status=000
+              fi
+
+              echo "── 시도 ${attempt} · 요청 ${request_attempt}/3 · mode=${request_mode} · HTTP ${status}"
+              if [ -s response.json ]; then
+                jq . response.json || cat response.json
+              fi
+
+              if [ "${status}" = "200" ]; then
+                break
+              fi
+
+              case "${status}" in
+                000|429|500|502|503|504)
+                  if [ "${request_attempt}" -lt 3 ]; then
+                    retry_delay=$((request_attempt * 10))
+                    echo "::warning::일시적 오류 HTTP ${status} (curl ${curl_exit}) — ${retry_delay}초 후 재시도합니다."
+                    sleep "${retry_delay}"
+                    continue
+                  fi
+                  ;;
+              esac
+
+              echo "::error::동기화가 HTTP ${status} (curl ${curl_exit}) 로 실패했습니다."
+              exit 1
+            done
+
+            if [ "$(jq -r '.ok' response.json)" != "true" ]; then
+              echo "::error::동기화 응답이 ok=false 입니다: $(jq -r '.error // "unknown"' response.json)"
+              exit 1
+            fi
+
+            # lastError 는 치명적이지 않다 — 상세 일부가 실패해도 나머지는 저장된다.
+            last_error=$(jq -r '.lastError // empty' response.json)
+            if [ -n "${last_error}" ]; then
+              echo "::warning::${last_error}"
+            fi
+
+            if [ "$(jq -r '.done' response.json)" = "true" ]; then
+              echo "완료 · 상품 $(jq -r '.productCount' response.json)건" \
+                   "(비진열 $(jq -r '.hiddenCount' response.json)건)" \
+                   "· 후기 $(jq -r '.reviewProducts // 0' response.json)건" \
+                   "· 한도 $(jq -r '.callLimit // "n/a"' response.json)"
+              exit 0
+            fi
+
+            echo "남은 상세 $(jq -r '.detailsRemaining' response.json)건 — 이어받습니다."
+          done
+
+          echo "::error::10회 안에 끝나지 않았습니다. 남은 상세는 다음 실행이 이어받습니다."
+          exit 1
