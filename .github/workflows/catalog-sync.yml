@@ -41,7 +41,7 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: 동기화 (done 이 될 때까지 이어받기)
         env:
@@ -59,10 +59,12 @@ jobs:
 
           echo "mode=${MODE}"
 
+          # full 은 상품 전체(약 430건)를 40건씩 받아 11회쯤 걸린다. 10회 상한은
+          # 매번 모자라 실패로 찍혔으므로 16회로 두고, 회당 약 2분이라 타임아웃은 45분이다.
           # 한 번에 상세 40건씩 하고 나머지는 서버가 기억한다. done 이 true 가
           # 될 때까지 이어받는다. full 은 매번 전체 대기열을 새로 만들기 때문에
           # 첫 요청에만 쓰고, 이후 요청은 pending 을 읽는 incremental 로 전환한다.
-          for attempt in $(seq 1 10); do
+          for attempt in $(seq 1 16); do
             if [ "${attempt}" -gt 1 ]; then sleep 5; fi
 
             request_mode="${MODE}"
@@ -131,5 +133,5 @@ jobs:
             echo "남은 상세 $(jq -r '.detailsRemaining' response.json)건 — 이어받습니다."
           done
 
-          echo "::error::10회 안에 끝나지 않았습니다. 남은 상세는 다음 실행이 이어받습니다."
+          echo "::error::16회 안에 끝나지 않았습니다. 남은 상세는 다음 실행이 이어받습니다."
           exit 1
